@@ -15,16 +15,32 @@ Run with:
     streamlit run app.py
 """
 
+import os
 import streamlit as st
 
-from spotify_client import search_artist
+# Bridge Streamlit Community Cloud's "Secrets" (st.secrets) into regular
+# environment variables, so the exact same os.getenv() calls in
+# spotify_client.py / lastfm_client.py work whether credentials come
+# from a local .env file (python-dotenv) or from Cloud's secrets.toml.
+# Locally, st.secrets just finds no secrets file and this quietly does
+# nothing — .env (loaded separately via python-dotenv) still works as before.
+try:
+    for _key, _value in st.secrets.items():
+        os.environ.setdefault(_key, str(_value))
+except Exception:
+    pass
+
+from spotify_client import search_artist, get_track_release_years
 from lastfm_client import get_artist_stats, get_top_tracks
 from risk_engine import (
     concentration_risk,
     fan_loyalty_ratio,
+    catalog_recency,
+    analyze_hit_timeline,
     run_monte_carlo_recoupment,
     label_benchmark_fit,
     DEFAULT_PRICE_PER_STREAM,
+    LABEL_PROFILES,
 )
 from charts import (
     plot_top_tracks_bar,
@@ -32,6 +48,7 @@ from charts import (
     plot_fan_loyalty_scale,
     plot_label_radar,
     plot_scenario_paths,
+    plot_hit_timeline,
 )
 
 st.set_page_config(
@@ -186,10 +203,12 @@ def _badge_color(badge_class: str) -> str:
 st.sidebar.title("A&R Scouting")
 st.sidebar.markdown("### Inputs")
 
-LABEL_OPTIONS = ["Dreamville", "TDE", "Cactus Jack", "OVO", "Motown",
-                  "Interscope", "Opium", "UMG", "Def Jam Recordings",
-                  "Death Row Records", "Cash Money Records", "Bad Boy Records",
-                  "Aftermath Entertainment", "Collective Music Group", "pgLang"]
+# Pulled straight from risk_engine.LABEL_PROFILES (sorted alphabetically)
+# so this dropdown can never drift out of sync with the actual profiles —
+# add a label there and it shows up here automatically. Streamlit's
+# selectbox lets you type to jump to a match, which doubles as a search
+# now that there are ~35 options.
+LABEL_OPTIONS = sorted(LABEL_PROFILES.keys())
 
 st.sidebar.markdown("**1 · Artist**")
 artist_name = st.sidebar.text_input("Artist name", value="Chris Patrick")
@@ -286,6 +305,20 @@ if len(top_tracks) < 2:
 
 track_playcounts = [t["playcount"] for t in top_tracks]
 
+# Best-effort release-date lookup via Spotify's track search (not the
+# blocked artist-top-tracks endpoint — see spotify_client.py). This is
+# supplementary, not critical path: if it fails or can't match a track,
+# the rest of the app still works, just without the timeline signal.
+try:
+    with st.spinner("Checking track release dates..."):
+        release_years_by_name = get_track_release_years(
+            [t["name"] for t in top_tracks], artist_name
+        )
+except Exception:
+    release_years_by_name = {}
+
+track_years_ago = [release_years_by_name.get(t["name"]) for t in top_tracks]
+
 artist = {
     "name": spotify_artist["name"] if spotify_artist else artist_name,
     "image_url": spotify_artist["image_url"] if spotify_artist else None,
@@ -309,6 +342,8 @@ if auto_estimate_streams:
 
 cr = concentration_risk(track_playcounts)
 flr = fan_loyalty_ratio(listeners=artist["listeners"], playcount=artist["playcount"])
+catalog_recency_years = catalog_recency(track_playcounts, track_years_ago)
+hit_timeline = analyze_hit_timeline(track_years_ago)
 
 # --- Growth scenarios ---------------------------------------------------
 # "organic_mu" is the sidebar's manual slider: growth with no label money
@@ -379,7 +414,9 @@ mc_result = scenario_results["Positive growth"]
 prob_recoup = mc_result["probability_of_recoupment"]
 effective_mu = scenario_mu["Positive growth"]
 
-fit_results = label_benchmark_fit(cr=cr, flr=flr, mu=effective_mu)
+fit_results = label_benchmark_fit(
+    cr=cr, flr=flr, mu=effective_mu, catalog_recency_years=catalog_recency_years
+)
 fitting_labels = [label for label, r in fit_results.items() if r["fits"]]
 nonfitting_labels = [label for label, r in fit_results.items() if not r["fits"]]
 target_fits = fit_results[label_target]["fits"]
@@ -482,7 +519,24 @@ flr_badge = (
 )
 fit_badge = ("badge-green", "Fit") if target_fits else ("badge-red", "Pass")
 
-k1, k2, k3, k4 = st.columns(4)
+TIMELINE_BADGE = {
+    "fresh_and_sustained": ("badge-green", "Active & sustained"),
+    "aging_but_active": ("badge-amber", "No recent hit"),
+    "unproven_spike": ("badge-amber", "Unproven breakout"),
+    "stale": ("badge-red", "Stale catalog"),
+    "unknown": ("badge-amber", "No data"),
+}
+timeline_badge = TIMELINE_BADGE[hit_timeline["status"]]
+
+TIMELINE_SUBTEXT = {
+    "fresh_and_sustained": "Has a hit from the last ~6 months, backed up by other hits around it — looks like a real trend, not a one-off.",
+    "aging_but_active": "Newest hit isn't brand new, but isn't ancient either — not a red flag on its own.",
+    "unproven_spike": "Has a hit from the last ~6 months, but nothing else on the timeline backs it up yet — could be a trend or could be a fluke.",
+    "stale": "Even the newest hit is years old — the catalog's numbers may reflect past relevance, not current momentum.",
+    "unknown": "Couldn't confidently match these tracks to Spotify release dates.",
+}
+
+k1, k2, k3, k4, k5 = st.columns(5)
 with k1:
     st.markdown(
         kpi_card(
@@ -523,6 +577,19 @@ with k4:
             fit_badge[1], fit_badge[0],
             "Signability against this label's benchmarks. See the ranked "
             "list below for labels that do fit.",
+        ),
+        unsafe_allow_html=True,
+    )
+with k5:
+    if hit_timeline["status"] == "unknown":
+        timeline_value = "—"
+    else:
+        timeline_value = f"{hit_timeline['most_recent_hit_years_ago']:.1f}y"
+    st.markdown(
+        kpi_card(
+            "Catalog timeline", timeline_value,
+            timeline_badge[1], timeline_badge[0],
+            TIMELINE_SUBTEXT[hit_timeline["status"]],
         ),
         unsafe_allow_html=True,
     )
@@ -608,7 +675,33 @@ with row1_col2:
         use_container_width=True,
     )
 
-st.plotly_chart(plot_label_radar(radar_scores), use_container_width=True)
+st.markdown(
+    '<h4 style="margin-bottom:2px;">Hit Timeline</h4>'
+    '<span style="font-size:13px; color:#9aa6bb;">Each top track plotted '
+    'by playcount and years since release — catches a catalog propped up '
+    'by an old hit, and a recent hit with nothing backing it up.</span>',
+    unsafe_allow_html=True,
+)
+st.plotly_chart(plot_hit_timeline(top_tracks, track_years_ago), use_container_width=True)
+st.caption(
+    "Best-effort: release dates come from matching each Last.fm top "
+    "track to Spotify's catalog search by name, which can occasionally "
+    "miss or mismatch a generically-titled track. Thresholds (hit "
+    "counts as \"recent\" under ~6 months, catalog reads as \"stale\" "
+    "past ~4.5 years with no newer hit) are this app's own modeling "
+    "assumptions, not an industry standard."
+)
+st.write("")
+
+# Radar is capped to the top 10 closest-fitting labels by score — with
+# ~35 label profiles now, plotting every one would make the chart
+# unreadable. The full fit/no-fit breakdown for every label is still
+# below this, unabridged.
+top_radar_labels = dict(
+    sorted(radar_scores.items(), key=lambda kv: kv[1], reverse=True)[:10]
+)
+st.plotly_chart(plot_label_radar(top_radar_labels), use_container_width=True)
+st.caption("Showing the 10 closest-fitting labels. Full ranked list is below.")
 
 # --- Label fit -----------------------------------------------------
 
