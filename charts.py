@@ -13,38 +13,79 @@ own with fake data.
 import numpy as np
 import plotly.graph_objects as go
 
+# Shared color palette, matching the dashboard's dark theme reference design.
+COLOR_BG = "#121826"       # card background
+COLOR_GRID = "#232c3d"     # gridlines / borders
+COLOR_TEXT = "#e8ecf3"     # primary text
+COLOR_MUTED = "#9aa6bb"    # secondary/muted text
+COLOR_CORAL = "#ff6b7f"    # highlight / "below break-even" / risk
+COLOR_BLUE = "#3b82a6"     # neutral bars
+COLOR_TEAL = "#2dd4bf"     # accent / "above break-even" / positive
+COLOR_AMBER = "#f5b455"    # reference lines / watch state
+COLOR_RED = "#ef4444"      # pure-decline growth scenario
+COLOR_VIOLET = "#a78bfa"   # comeback-arc growth scenario
+
+FONT_FAMILY = "Inter, system-ui, sans-serif"
+
+# Shared scenario -> color mapping, used by both the KPI badges in app.py
+# (imported there) and the comparison chart below, so a scenario always
+# reads as the same color everywhere it shows up.
+SCENARIO_COLORS = {
+    "No growth": COLOR_AMBER,
+    "Positive growth": COLOR_TEAL,
+    "Positive, then negative": COLOR_CORAL,
+    "Negative growth": COLOR_RED,
+    "Negative, then positive": COLOR_VIOLET,
+}
+
+
+def _apply_dark_theme(fig: go.Figure, **extra_layout) -> go.Figure:
+    """Apply the shared dark card styling to any chart's layout."""
+    fig.update_layout(
+        paper_bgcolor=COLOR_BG,
+        plot_bgcolor=COLOR_BG,
+        font=dict(family=FONT_FAMILY, color=COLOR_TEXT, size=13),
+        title_font=dict(size=16, color=COLOR_TEXT),
+        xaxis=dict(gridcolor=COLOR_GRID, zerolinecolor=COLOR_GRID, color=COLOR_MUTED),
+        yaxis=dict(gridcolor=COLOR_GRID, zerolinecolor=COLOR_GRID, color=COLOR_MUTED),
+        margin=dict(t=56, b=40, l=48, r=24),
+        **extra_layout,
+    )
+    return fig
+
 
 def plot_top_tracks_bar(tracks: list[dict]) -> go.Figure:
     """
-    Chart 1: Bar chart of top track popularities, highlighting track #1
+    Chart 1: Bar chart of top track playcounts, highlighting track #1
     against the average of tracks 2-10 (visualizes Concentration Risk).
 
     Parameters
     ----------
     tracks : list[dict]
-        Output of spotify_client.get_top_tracks(), each with
-        {"name": str, "popularity": int, ...}, sorted descending.
+        Output of lastfm_client.get_top_tracks(), each with
+        {"name": str, "playcount": int}, sorted descending.
 
     Returns
     -------
     go.Figure
     """
     names = [t["name"] for t in tracks]
-    popularities = [t["popularity"] for t in tracks]
+    playcounts = [t["playcount"] for t in tracks]
 
     # Highlight the #1 track in a different color from the rest
-    colors = ["#E63946"] + ["#457B9D"] * (len(tracks) - 1)
+    colors = [COLOR_CORAL] + [COLOR_BLUE] * (len(tracks) - 1)
 
-    avg_rest = np.mean(popularities[1:]) if len(popularities) > 1 else 0
+    avg_rest = np.mean(playcounts[1:]) if len(playcounts) > 1 else 0
 
     fig = go.Figure(
         data=[
             go.Bar(
                 x=names,
-                y=popularities,
+                y=playcounts,
                 marker_color=colors,
-                text=popularities,
+                text=[f"{p:,}" for p in playcounts],
                 textposition="outside",
+                textfont=dict(color=COLOR_TEXT),
             )
         ]
     )
@@ -52,16 +93,18 @@ def plot_top_tracks_bar(tracks: list[dict]) -> go.Figure:
     fig.add_hline(
         y=avg_rest,
         line_dash="dash",
-        line_color="gray",
-        annotation_text=f"Avg tracks 2-10: {avg_rest:.1f}",
+        line_color=COLOR_AMBER,
+        line_width=2,
+        annotation_text=f"Avg tracks 2-10: {avg_rest:,.0f}",
         annotation_position="top left",
+        annotation_font_color=COLOR_AMBER,
     )
 
-    fig.update_layout(
-        title="Top Track Popularity (Concentration Risk View)",
+    _apply_dark_theme(
+        fig,
+        title="One song carries the catalog",
         xaxis_title="Track",
-        yaxis_title="Popularity (0-100)",
-        yaxis_range=[0, 105],
+        yaxis_title="Playcount (Last.fm)",
         showlegend=False,
     )
     return fig
@@ -86,12 +129,21 @@ def plot_monte_carlo_distribution(
     -------
     go.Figure
     """
+    # Build the histogram manually (rather than go.Histogram) so each bin
+    # can be colored by whether it clears the advance — coral below
+    # break-even, teal above it — matching the reference design's split.
+    counts, bin_edges = np.histogram(cumulative_revenue, bins=50)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bin_width = bin_edges[1] - bin_edges[0]
+    bar_colors = [COLOR_TEAL if c >= advance else COLOR_CORAL for c in bin_centers]
+
     fig = go.Figure(
         data=[
-            go.Histogram(
-                x=cumulative_revenue,
-                nbinsx=50,
-                marker_color="#457B9D",
+            go.Bar(
+                x=bin_centers,
+                y=counts,
+                width=bin_width * 0.95,
+                marker_color=bar_colors,
                 name="Simulated outcomes",
             )
         ]
@@ -99,69 +151,79 @@ def plot_monte_carlo_distribution(
 
     fig.add_vline(
         x=advance,
-        line_color="red",
+        line_color=COLOR_TEXT,
         line_width=2,
         annotation_text=f"Break-even: ${advance:,.0f}",
         annotation_position="top right",
+        annotation_font_color=COLOR_TEXT,
     )
 
-    fig.update_layout(
-        title="Monte Carlo Simulation: 24-Month Revenue Distribution",
+    _apply_dark_theme(
+        fig,
+        title=f"{(cumulative_revenue >= advance).mean() * 100:.0f}% of outcomes clear the advance",
         xaxis_title="Projected Revenue ($)",
         yaxis_title="Number of Simulations",
         bargap=0.02,
+        showlegend=False,
     )
     return fig
 
 
-def plot_fan_loyalty_scale(flr: float, popularity: int) -> go.Figure:
+def plot_fan_loyalty_scale(listeners: int, playcount: int, flr: float) -> go.Figure:
     """
-    Chart 3: A simple horizontal gauge-style comparison of Fan Loyalty
-    Ratio against raw popularity, so a viewer can see at a glance whether
-    an artist's popularity is backed by loyal followers or is more
-    playlist-driven.
+    Chart 3: Shows the Fan Loyalty Ratio (average plays per listener)
+    as a bar, with the raw listeners/playcount numbers it's built from
+    labeled alongside it for context.
+
+    NOTE: this chart changed from comparing FLR against a 0-100 Spotify
+    popularity score (no longer available) to instead showing FLR's own
+    two raw ingredients — listeners and playcount — since there's no
+    longer a second "popularity" number to compare it against. See
+    risk_engine.fan_loyalty_ratio() for the formula.
 
     Parameters
     ----------
+    listeners : int
+        Unique Last.fm listeners.
+    playcount : int
+        Total plays across all listeners.
     flr : float
-        Fan Loyalty Ratio, from risk_engine.fan_loyalty_ratio().
-    popularity : int
-        Spotify popularity score (0-100).
+        Fan Loyalty Ratio (playcount / listeners), from
+        risk_engine.fan_loyalty_ratio().
 
     Returns
     -------
     go.Figure
     """
-    # FLR is unbounded, so we cap the display scale at a sensible value
-    # for visualization purposes only (doesn't affect the underlying number).
-    display_flr = min(flr, 5.0)
-
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Bar(
-            y=["Fan Loyalty Ratio"],
-            x=[display_flr],
-            orientation="h",
-            marker_color="#2A9D8F",
-            name="Fan Loyalty Ratio",
-        )
-    )
-    fig.add_trace(
-        go.Bar(
-            y=["Popularity (scaled /20)"],
-            x=[popularity / 20],  # scale 0-100 down to comparable 0-5 range
-            orientation="h",
-            marker_color="#E9C46A",
-            name="Popularity (scaled)",
-        )
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=["Fan Loyalty Ratio<br>(avg plays per listener)"],
+                y=[flr],
+                marker_color=COLOR_TEAL,
+                text=[f"{flr:.1f}"],
+                textposition="outside",
+                textfont=dict(color=COLOR_TEXT),
+            )
+        ]
     )
 
-    fig.update_layout(
-        title="Fan Loyalty vs. Popularity",
-        xaxis_title="Relative Scale",
-        barmode="group",
+    _apply_dark_theme(
+        fig,
+        title="Fan Loyalty Ratio",
+        yaxis_title="Avg. plays per listener",
         showlegend=False,
+        annotations=[
+            dict(
+                text=(
+                    f"{listeners:,} listeners  ·  {playcount:,} total plays"
+                ),
+                xref="paper", yref="paper",
+                x=0.5, y=1.15,
+                showarrow=False,
+                font=dict(size=12, color=COLOR_MUTED),
+            )
+        ],
     )
     return fig
 
@@ -196,15 +258,76 @@ def plot_label_radar(label_scores: dict) -> go.Figure:
                 r=values_closed,
                 theta=labels_closed,
                 fill="toself",
-                marker_color="#E63946",
+                marker_color=COLOR_TEAL,
+                line_color=COLOR_TEAL,
+                fillcolor="rgba(45, 212, 191, 0.25)",
             )
         ]
     )
 
-    fig.update_layout(
+    _apply_dark_theme(
+        fig,
         title="Label Alignment Scorecard",
-        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+        polar=dict(
+            bgcolor=COLOR_BG,
+            radialaxis=dict(
+                visible=True, range=[0, 100],
+                gridcolor=COLOR_GRID, color=COLOR_MUTED,
+            ),
+            angularaxis=dict(gridcolor=COLOR_GRID, color=COLOR_MUTED),
+        ),
         showlegend=False,
+    )
+    return fig
+
+
+def plot_scenario_paths(scenario_results: dict) -> go.Figure:
+    """
+    Chart 5: Overlays the median simulated monthly-stream path for every
+    growth scenario on one log-scale line chart, so you can see the
+    shape of each trajectory side by side rather than just its final
+    recoupment odds.
+
+    Parameters
+    ----------
+    scenario_results : dict
+        Maps scenario name -> the dict returned by
+        risk_engine.run_monte_carlo_recoupment(), each containing a
+        "paths" array of shape (simulations, months + 1) with monthly
+        stream counts (month 0 = starting streams).
+
+    Returns
+    -------
+    go.Figure
+    """
+    fig = go.Figure()
+
+    for name, result in scenario_results.items():
+        paths = result["paths"]
+        median_path = np.median(paths, axis=0)
+        months = np.arange(len(median_path))
+        color = SCENARIO_COLORS.get(name, COLOR_BLUE)
+
+        fig.add_trace(
+            go.Scatter(
+                x=months,
+                y=median_path,
+                mode="lines",
+                name=name,
+                line=dict(color=color, width=2.5),
+            )
+        )
+
+    _apply_dark_theme(
+        fig,
+        title="Median projected monthly streams by scenario",
+        xaxis_title="Month",
+        yaxis_title="Monthly streams (log scale)",
+        yaxis_type="log",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
+            font=dict(color=COLOR_TEXT, size=11),
+        ),
     )
     return fig
 
@@ -213,9 +336,11 @@ if __name__ == "__main__":
     # Quick manual smoke test with fake data — writes HTML files you can
     # open in a browser to sanity-check the charts without Streamlit.
     fake_tracks = [
-        {"name": f"Track {i}", "popularity": p}
+        {"name": f"Track {i}", "playcount": p}
         for i, p in enumerate(
-            [88, 60, 55, 50, 48, 45, 40, 38, 35, 30], start=1
+            [8_800_000, 6_000_000, 5_500_000, 5_000_000, 4_800_000,
+             4_500_000, 4_000_000, 3_800_000, 3_500_000, 3_000_000],
+            start=1,
         )
     ]
     plot_top_tracks_bar(fake_tracks).write_html("test_chart1.html")
@@ -225,10 +350,12 @@ if __name__ == "__main__":
         "test_chart2.html"
     )
 
-    plot_fan_loyalty_scale(flr=1.4, popularity=75).write_html("test_chart3.html")
+    plot_fan_loyalty_scale(
+        listeners=1_200_000, playcount=18_000_000, flr=15.0
+    ).write_html("test_chart3.html")
 
     plot_label_radar(
-        {"Dreamville / TDE": 80, "Cactus Jack / OVO": 45}
+        {"Dreamville": 80, "Cactus Jack": 45}
     ).write_html("test_chart4.html")
 
     print("Wrote test_chart1.html through test_chart4.html — open them in a browser.")
