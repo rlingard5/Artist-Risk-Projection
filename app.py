@@ -15,6 +15,8 @@ Run with:
     streamlit run app.py
 """
 
+from __future__ import annotations
+
 import os
 import streamlit as st
 

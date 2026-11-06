@@ -10,6 +10,8 @@ already produced. That separation makes each chart easy to test on its
 own with fake data.
 """
 
+from __future__ import annotations
+
 import numpy as np
 import plotly.graph_objects as go
 
@@ -329,6 +331,99 @@ def plot_scenario_paths(scenario_results: dict) -> go.Figure:
             font=dict(color=COLOR_TEXT, size=11),
         ),
     )
+    return fig
+
+
+def plot_hit_timeline(tracks: list[dict], track_years_ago: list[float | None]) -> go.Figure:
+    """
+    Chart 6: Scatter of each top track's playcount against how long ago
+    it was released, with shaded reference bands for the "stale" and
+    "recent" zones used by risk_engine.analyze_hit_timeline(). Tracks
+    with no confident release-date match are left out (can't place them
+    on a timeline).
+
+    Parameters
+    ----------
+    tracks : list[dict]
+        lastfm_client.get_top_tracks() output, {"name": str, "playcount": int}.
+    track_years_ago : list[float | None]
+        Years since release per track, same order as `tracks`, from
+        spotify_client.get_track_release_years().
+
+    Returns
+    -------
+    go.Figure
+    """
+    # Import here (not at module load) to avoid a hard dependency for
+    # callers that only use the other charts; these thresholds mirror
+    # risk_engine.py's own constants but are duplicated rather than
+    # imported, to keep charts.py free of a risk_engine dependency.
+    STALE_THRESHOLD_YEARS = 4.5
+    RECENT_WINDOW_YEARS = 0.5
+
+    points = [
+        (t["name"], t["playcount"], years)
+        for t, years in zip(tracks, track_years_ago)
+        if years is not None
+    ]
+
+    if not points:
+        fig = go.Figure()
+        _apply_dark_theme(
+            fig,
+            title="Hit Timeline — no release-date data available",
+            showlegend=False,
+        )
+        return fig
+
+    names, playcounts, years = zip(*points)
+    colors = [
+        COLOR_TEAL if y <= RECENT_WINDOW_YEARS
+        else COLOR_CORAL if y > STALE_THRESHOLD_YEARS
+        else COLOR_BLUE
+        for y in years
+    ]
+
+    fig = go.Figure(
+        data=[
+            go.Scatter(
+                x=list(years),
+                y=list(playcounts),
+                mode="markers+text",
+                text=list(names),
+                textposition="top center",
+                textfont=dict(color=COLOR_MUTED, size=10),
+                marker=dict(size=14, color=colors, line=dict(width=1, color=COLOR_BG)),
+            )
+        ]
+    )
+
+    max_x = max(max(years), STALE_THRESHOLD_YEARS) + 0.5
+
+    # Shade the "recent" zone (left edge, newest) and "stale" zone (right
+    # edge, oldest) so the timeline's two red/green flags are visible at
+    # a glance, not just inferable from dot color.
+    fig.add_vrect(
+        x0=-0.1, x1=RECENT_WINDOW_YEARS,
+        fillcolor=COLOR_TEAL, opacity=0.08, line_width=0,
+        annotation_text="Recent", annotation_position="top left",
+        annotation_font_color=COLOR_TEAL,
+    )
+    fig.add_vrect(
+        x0=STALE_THRESHOLD_YEARS, x1=max_x,
+        fillcolor=COLOR_CORAL, opacity=0.08, line_width=0,
+        annotation_text="Stale", annotation_position="top right",
+        annotation_font_color=COLOR_CORAL,
+    )
+
+    _apply_dark_theme(
+        fig,
+        title="Hit Timeline — are the hits recent, or carried by old material?",
+        xaxis_title="Years since release (0 = today)",
+        yaxis_title="Playcount (Last.fm)",
+        showlegend=False,
+    )
+    fig.update_xaxes(autorange="reversed")  # newest on the right, like a timeline
     return fig
 
 

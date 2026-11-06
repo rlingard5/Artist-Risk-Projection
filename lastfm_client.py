@@ -15,6 +15,8 @@ Spotify's API works fine), and this module supplies the actual numbers
 the risk formulas run on.
 """
 
+from __future__ import annotations
+
 import os
 import time
 import requests
