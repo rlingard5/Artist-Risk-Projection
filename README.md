@@ -26,8 +26,6 @@ bash
    SPOTIFY_CLIENT_SECRET=your_spotify_client_secret_here
    LASTFM_API_KEY=your_lastfm_api_key_here
 
-Never commit your real .env file — only .env.example should be tracked in git.
-
 Run the app
 bash
    python -m streamlit run app.py
