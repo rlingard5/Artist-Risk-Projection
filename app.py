@@ -286,7 +286,10 @@ st.sidebar.markdown("**3 · Revenue simulation**")
 st.sidebar.caption(
     "No public API gives real current monthly stream counts, so this is "
     "either auto-estimated from each artist's Last.fm track data (rough, "
-    "scales with artist size) or your own manual number."
+    "scales with artist size) or your own manual number. **If you know the "
+    "artist's real current streams** (Spotify for Artists, Chartmetric, "
+    "Soundcharts, etc.), enter them manually — it's always more accurate "
+    "than the auto-estimate below."
 )
 if compare_mode:
     # A single manual stream count can't honestly apply to two different
@@ -310,6 +313,23 @@ else:
         )
     else:
         manual_streams = None  # computed after fetching the artist's data below
+
+if auto_estimate_streams:
+    lastfm_scale_multiplier = st.sidebar.slider(
+        "Last.fm-to-real-streams multiplier",
+        min_value=1.0, max_value=20.0, value=1.0, step=0.5, format="%.1fx",
+        help="Last.fm only counts 'scrobbles' from users who've connected a "
+             "scrobbling app — a small, self-selected slice of an artist's "
+             "real audience. For artists whose fans mostly don't scrobble "
+             "(common for mainstream/pop/hip-hop audiences), the auto-"
+             "estimate below can undercount real streaming volume by 10x "
+             "or more. If you know this artist's real stream count is "
+             "higher than the auto-estimate, raise this to scale it up — "
+             "it's a manual correction, not measured data. Leave at 1.0x "
+             "if you don't know, or just switch to manual entry instead.",
+    )
+else:
+    lastfm_scale_multiplier = 1.0
 
 organic_mu = st.sidebar.slider(
     "Organic monthly growth (without label investment)",
@@ -342,6 +362,7 @@ def evaluate_artist(
     organic_mu: float,
     sigma: float,
     royalty_rate: float,
+    lastfm_scale_multiplier: float = 1.0,
 ) -> dict:
     """
     Runs the full data-fetch + risk-math pipeline for one artist and
@@ -349,6 +370,13 @@ def evaluate_artist(
     or calls st.stop() — any failure comes back as {"ok": False, "error":
     "..."} so a caller running two artists (compare mode) can show one
     artist's results even if the other one's lookup fails.
+
+    lastfm_scale_multiplier only applies when auto_estimate_streams is
+    True — it's a manual correction for Last.fm's structural undercount
+    of real streaming volume (Last.fm only sees "scrobbles" from users
+    who've connected a scrobbling app, a small self-selected slice of an
+    artist's real audience), not a measured value. Has no effect on a
+    manually-entered stream count.
     """
     try:
         spotify_artist = search_artist(artist_name)
@@ -432,7 +460,7 @@ def evaluate_artist(
     if auto_estimate_streams:
         starting_streams = max(
             sum(track_playcounts) / ASSUMED_ACCUMULATION_MONTHS, 10_000
-        )
+        ) * lastfm_scale_multiplier
     else:
         starting_streams = manual_streams
 
@@ -535,6 +563,7 @@ def evaluate_artist(
         "advance_amount": advance_amount,
         "label_target": label_target,
         "auto_estimate_streams": auto_estimate_streams,
+        "lastfm_scale_multiplier": lastfm_scale_multiplier,
         "starting_streams": starting_streams,
         "royalty_rate": royalty_rate,
         "effective_price_per_stream": effective_price_per_stream,
@@ -585,6 +614,7 @@ def render_report(bundle: dict) -> None:
     advance_amount = bundle["advance_amount"]
     label_target = bundle["label_target"]
     auto_estimate_streams = bundle["auto_estimate_streams"]
+    lastfm_scale_multiplier = bundle["lastfm_scale_multiplier"]
     starting_streams = bundle["starting_streams"]
     royalty_rate = bundle["royalty_rate"]
     effective_price_per_stream = bundle["effective_price_per_stream"]
@@ -627,10 +657,17 @@ def render_report(bundle: dict) -> None:
     if confidence["level"] == "low":
         st.warning(f"⚠️ Low data confidence: {confidence['message']}")
 
+    multiplier_note = (
+        f" × {lastfm_scale_multiplier:.1f} manual correction"
+        if auto_estimate_streams and lastfm_scale_multiplier != 1.0 else ""
+    )
     streams_note = (
         f"Simulation uses an auto-estimated {starting_streams:,.0f} current monthly "
-        f"streams (top-10 track playcounts ÷ {ASSUMED_ACCUMULATION_MONTHS} months — "
-        "a rough heuristic, not a real stream count)."
+        f"streams (top-10 track playcounts ÷ {ASSUMED_ACCUMULATION_MONTHS} months"
+        f"{multiplier_note} — a rough heuristic, not a real stream count. Last.fm "
+        "only counts scrobbles from users who've connected a scrobbling app, so "
+        "this tends to undercount mainstream artists; enter a real number "
+        "manually if you have one)."
         if auto_estimate_streams else
         f"Simulation uses your manually-set {starting_streams:,.0f} current monthly streams."
     )
@@ -945,10 +982,12 @@ if compare_mode and second_artist_name.strip():
         bundle_a = evaluate_artist(
             artist_name, advance_amount, label_target,
             auto_estimate_streams, manual_streams, organic_mu, sigma, royalty_rate,
+            lastfm_scale_multiplier,
         )
         bundle_b = evaluate_artist(
             second_artist_name, advance_amount, label_target,
             auto_estimate_streams, manual_streams, organic_mu, sigma, royalty_rate,
+            lastfm_scale_multiplier,
         )
 
     if bundle_a["ok"] and bundle_b["ok"]:
@@ -993,6 +1032,7 @@ else:
         bundle = evaluate_artist(
             artist_name, advance_amount, label_target,
             auto_estimate_streams, manual_streams, organic_mu, sigma, royalty_rate,
+            lastfm_scale_multiplier,
         )
 
     if not bundle["ok"]:

@@ -321,6 +321,18 @@ python -m streamlit run app.py
 - Last.fm's `playcount` is a **lifetime total**, not a monthly figure — the
   "auto-estimate current monthly streams" option is a rough heuristic
   (total ÷ 12), not a real stream count. Manual entry is more reliable.
+- Last.fm only counts **scrobbles** — plays from users who've connected a
+  scrobbling app/plugin to their streaming service. That's a small,
+  self-selected slice of an artist's real audience, and adoption varies a
+  lot by fanbase: it's a decent proxy for artists whose fans skew toward
+  more tech-savvy/indie-leaning listening habits, but can undercount a
+  mainstream artist's real streaming volume by 10x or more, since most of
+  their fans never set up scrobbling at all. The "Last.fm-to-real-streams
+  multiplier" slider (shown when auto-estimate is on) is a manual way to
+  correct for this when you know an artist's real numbers are higher —
+  it's a fudge factor you set yourself, not derived from any data. When
+  you have a real stream count (Spotify for Artists, Chartmetric,
+  Soundcharts, etc.), manual entry is always more accurate than either.
 - Track release dates are matched by name via Spotify search and can
   occasionally miss or mismatch a generically-titled track.
 - Spotify's standard API access no longer exposes `followers`, `popularity`,
