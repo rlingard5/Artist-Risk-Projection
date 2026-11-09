@@ -358,8 +358,8 @@ def plot_hit_timeline(tracks: list[dict], track_years_ago: list[float | None]) -
     # callers that only use the other charts; these thresholds mirror
     # risk_engine.py's own constants but are duplicated rather than
     # imported, to keep charts.py free of a risk_engine dependency.
-    STALE_THRESHOLD_YEARS = 4.5
-    RECENT_WINDOW_YEARS = 0.5
+    STALE_THRESHOLD_YEARS = 6.0
+    RECENT_WINDOW_YEARS = 2.0
 
     points = [
         (t["name"], t["playcount"], years)

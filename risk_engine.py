@@ -108,6 +108,63 @@ def fan_loyalty_ratio(listeners: int, playcount: int) -> float:
     return playcount / listeners
 
 
+# Thresholds for data_confidence() below. CR, FLR, and growth are all
+# ratios/rates — with only a handful of listeners, a single superfan
+# replaying a track 50 times can swing FLR wildly, and the whole catalog
+# can be a couple thousand plays. These are this app's own judgment calls
+# about when a sample is "thin," not a statistical significance test.
+LOW_CONFIDENCE_LISTENERS = 1_000
+MODERATE_CONFIDENCE_LISTENERS = 10_000
+
+
+def data_confidence(listeners: int) -> dict:
+    """
+    Flags how much weight to put on an artist's CR/FLR/Hit-Timeline
+    numbers, based on how small the underlying Last.fm listener count is.
+
+    A ratio computed from a handful of listeners is statistically noisy —
+    a single very active fan can distort it — even though the formula
+    itself is identical to one computed from millions of listeners. This
+    doesn't change any of the other numbers; it's a flag for how much to
+    trust them.
+
+    Parameters
+    ----------
+    listeners : int
+        Unique Last.fm listeners for the artist.
+
+    Returns
+    -------
+    dict
+        {
+            "level": str,  # "low" | "moderate" | "high"
+            "message": str,
+        }
+    """
+    if listeners < LOW_CONFIDENCE_LISTENERS:
+        return {
+            "level": "low",
+            "message": (
+                f"Only {listeners:,} Last.fm listeners — ratios like CR and "
+                "FLR are statistically noisy at this scale (a single active "
+                "fan can swing them). Treat results as directional, not precise."
+            ),
+        }
+    if listeners < MODERATE_CONFIDENCE_LISTENERS:
+        return {
+            "level": "moderate",
+            "message": (
+                f"{listeners:,} Last.fm listeners is a moderate sample — "
+                "numbers are more stable than a brand-new artist's, but "
+                "still worth a grain of salt."
+            ),
+        }
+    return {
+        "level": "high",
+        "message": f"{listeners:,} Last.fm listeners is a solid sample size.",
+    }
+
+
 def catalog_recency(track_playcounts: list[int], track_years_ago: list[float | None]) -> float | None:
     """
     Weighted-average age (in years) of an artist's top tracks, weighted
@@ -160,24 +217,33 @@ def catalog_recency(track_playcounts: list[int], track_years_ago: list[float | N
 # Thresholds for analyze_hit_timeline() below — this app's own modeling
 # assumptions, not an industry standard, and worth re-tuning per genre
 # (a pop artist's hit cycle looks different from a rapper's mixtape cycle).
-STALE_THRESHOLD_YEARS = 4.5   # a catalog whose newest hit is older than this reads as "stale"
-RECENT_WINDOW_YEARS = 0.5     # ~6 months: how new a hit has to be to count as "recent"
-SUPPORT_WINDOW_YEARS = 2.5    # how far back to look for a hit that "backs up" a recent one
+STALE_THRESHOLD_YEARS = 6.0   # a catalog whose newest hit is older than this reads as "stale"
+RECENT_WINDOW_YEARS = 2.0     # how new a hit has to be to count as "recent"
+SUPPORT_WINDOW_YEARS = 4.0    # how far back to look for a hit that "backs up" a recent one
 
 
-def analyze_hit_timeline(track_years_ago: list[float | None]) -> dict:
+def analyze_hit_timeline(
+    track_years_ago: list[float | None],
+    latest_album_years_ago: float | None = None,
+) -> dict:
     """
-    Classifies an artist's hit pattern over time, to catch two different
-    red flags a raw playcount or recency average can miss:
+    Classifies an artist's hit pattern over time, to catch red flags a raw
+    playcount or recency average can miss:
 
     1. "Stale" — the catalog's numbers are real, but nothing in it is
        recent; the artist may be past their growth window rather than
        still building one.
-    2. "Unproven spike" — the artist has one hit from the last ~6 months,
+    2. "Unproven spike" — the artist has one hit from the last ~2 years,
        but nothing else on the timeline backs it up (no earlier hit
        building toward it, no second recent hit alongside it). That's a
        real signal, but on its own it could be a fluke rather than a
        trend — a label betting on this timeline is betting it repeats.
+    3. "Recent flop" — the artist released a full album within the last
+       RECENT_WINDOW_YEARS, but none of their top tracks by playcount are
+       from that recent window at all. That's a stronger, more specific
+       negative than plain staleness: this isn't an artist who's been
+       quiet, it's one who tried something recently and it didn't catch
+       on with listeners.
 
     An artist with a recent hit AND supporting hits around it (either an
     earlier one within SUPPORT_WINDOW_YEARS, or more than one hit inside
@@ -190,16 +256,24 @@ def analyze_hit_timeline(track_years_ago: list[float | None]) -> dict:
         Years since release per top track, same order as the track list,
         from spotify_client.get_track_release_years(). None entries
         (no confident Spotify match) are ignored rather than guessed at.
+    latest_album_years_ago : float | None
+        Years since the artist's most recent album, from
+        spotify_client.get_latest_album_years_ago(). None (no album found,
+        or the lookup failed) skips the "recent flop" check entirely
+        rather than treating missing data as a red flag.
 
     Returns
     -------
     dict
         {
             "status": str,  # "fresh_and_sustained" | "aging_but_active"
-                             # | "unproven_spike" | "stale" | "unknown"
+                             # | "unproven_spike" | "stale"
+                             # | "recent_flop" | "unknown"
             "most_recent_hit_years_ago": float | None,
             "oldest_hit_years_ago": float | None,
             "known_track_count": int,
+            "latest_album_years_ago": float | None,
+            "recent_album_no_hit": bool,
         }
         "unknown" means no track had a usable release date at all —
         the app should treat that as "no data," not as a red flag.
@@ -212,14 +286,28 @@ def analyze_hit_timeline(track_years_ago: list[float | None]) -> dict:
             "most_recent_hit_years_ago": None,
             "oldest_hit_years_ago": None,
             "known_track_count": 0,
+            "latest_album_years_ago": latest_album_years_ago,
+            "recent_album_no_hit": False,
         }
 
     most_recent = known[0]
     oldest = known[-1]
     has_recent_hit = most_recent <= RECENT_WINDOW_YEARS
 
+    # A recent album that produced nothing in the top-tracks-by-playcount
+    # list at all is a stronger signal than plain staleness — the artist
+    # clearly tried, and it didn't land with listeners.
+    recent_album_no_hit = (
+        latest_album_years_ago is not None
+        and latest_album_years_ago <= RECENT_WINDOW_YEARS
+        and not has_recent_hit
+    )
+
     if not has_recent_hit:
-        status = "stale" if most_recent > STALE_THRESHOLD_YEARS else "aging_but_active"
+        if recent_album_no_hit:
+            status = "recent_flop"
+        else:
+            status = "stale" if most_recent > STALE_THRESHOLD_YEARS else "aging_but_active"
     else:
         recent_hit_count = sum(1 for y in known if y <= RECENT_WINDOW_YEARS)
         has_supporting_hit = any(
@@ -235,6 +323,8 @@ def analyze_hit_timeline(track_years_ago: list[float | None]) -> dict:
         "most_recent_hit_years_ago": most_recent,
         "oldest_hit_years_ago": oldest,
         "known_track_count": len(known),
+        "latest_album_years_ago": latest_album_years_ago,
+        "recent_album_no_hit": recent_album_no_hit,
     }
 
 
@@ -366,55 +456,55 @@ def run_monte_carlo_recoupment(
 LABEL_PROFILES = {
     "Dreamville": {
         "max_cr": 2.7,
-        "min_flr": 15,
+        "min_flr": 10,
         "max_hit_age_years": 3.0,
-        "description": "Low concentration risk, high fan loyalty, steady catalog depth.",
+        "genres": ["hip hop", "rap", "conscious hip hop", "r&b", "rnb"],
+        "description": "Calibrated from real signing history — 6 of 7 roster artists (Bas, Omen, Cozz, Lute, JID, EarthGang) were signed off a mixtape or EP with no prior album, with pre-signing reach from ~500k mixtape downloads (Bas) to ~5M indie streams (EarthGang); Ari Lennox brought the roster into R&B. The bet paid off commercially too — JID's debut single went RIAA Gold and charted on the Billboard 200. Low entry bar for traction, but low concentration risk and deep catalog loyalty once developed.",
     },
     "TDE": {
         "max_cr": 2.7,
-        "min_flr": 15,
+        "min_flr": 10,
         "max_hit_age_years": 3.0,
-        "description": "Low concentration risk, high fan loyalty, steady catalog depth.",
+        "genres": ["hip hop", "rap", "conscious hip hop", "r&b", "rnb"],
+        "description": "Calibrated from real signing history — Jay Rock, Kendrick Lamar, Ab-Soul and Schoolboy Q were all signed in the pre-streaming era with essentially zero digital footprint (street mixtapes/CD handouts); later signees like Doechii arrived with real viral numbers (~15M streams). SZA's debut EP went on to a Gold-certified track and charted on the Billboard 200, confirming the label's bets on unproven talent do convert. Near-zero entry bar for traction historically, but famously low-volume and loyalty-driven once an artist is in.",
     },
     "Cactus Jack": {
         "max_cr": 5.0,
         "min_flr": 0,
-        "min_mu": 0.03,
+        "min_mu": 0.035,
         "max_hit_age_years": 2.5,
-        "description": "Tolerates hit-driven catalogs, prioritizes growth velocity.",
+        "genres": ["hip hop", "rap", "trap"],
+        "description": "Calibrated from real signing history — Sheck Wes (~50M streams on 'Mo Bamba'), Don Toliver (~5M pre-Astroworld) and SoFaygo (~30M on 'Knock Knock') were all already-viral on SoundCloud/Spotify before signing with no album out. Both Sheck Wes's MUDBOY and Don Toliver's Heaven or Hell went RIAA Platinum, backing up the high growth-rate bar (min_mu) this viral-first profile sets.",
     },
     "OVO": {
         "max_cr": 5.0,
         "min_flr": 0,
         "min_mu": 0.03,
         "max_hit_age_years": 3.0,
-        "description": "Tolerates hit-driven catalogs, prioritizes growth velocity.",
+        "genres": ["hip hop", "rap", "r&b", "rnb", "dancehall"],
+        "description": "Calibrated from real signing history — pre-signing reach ranged from near-zero (PARTYNEXTDOOR, Myspace-era demos) to Popcaan's ~20M Caribbean/YouTube streams; most of the roster (Majid Jordan, Roy Woods, DVSN, Smiley) sat in the 1-5M range with no album yet. PARTYNEXTDOOR's zero-traction bet still converted to a Gold-certified lead single. Popcaan's signing adds dancehall to the genre mix alongside hip-hop/R&B.",
     },
     "Motown": {
         "max_cr": 3.0,
         "min_flr": 10,
         "max_hit_age_years": 5.0,
+        "genres": ["soul", "r&b", "rnb", "motown", "pop"],
         "description": "Assumed profile — steady catalog depth, moderate fan loyalty floor.",
-    },
-    "Interscope": {
-        "max_cr": 4.5,
-        "min_flr": 5,
-        "min_mu": 0.02,
-        "max_hit_age_years": 3.0,
-        "description": "Assumed profile — major-label generalist: tolerates some hit-dependence, wants steady growth.",
     },
     "Opium": {
         "max_cr": 6.0,
         "min_flr": 2,
         "min_mu": 0.04,
         "max_hit_age_years": 2.0,
-        "description": "Assumed profile — Playboi Carti's imprint: tolerates high concentration risk (viral/aesthetic-driven singles), prioritizes fast growth over catalog depth or broad fan loyalty.",
+        "genres": ["hip hop", "rap", "trap", "underground rap"],
+        "description": "Calibrated from real signing history — Ken Carson (~5M), Destroy Lonely (~10M) and Homixide Gang (~2M) were all signed off SoundCloud/TikTok streams on an early EP, no album yet. Confirms Playboi Carti's imprint takes already-viral, aesthetic-driven acts and prioritizes fast growth over catalog depth or broad fan loyalty.",
     },
     "Def Jam Recordings": {
         "max_cr": 4.5,
         "min_flr": 5,
         "min_mu": 0.02,
         "max_hit_age_years": 3.0,
+        "genres": ["hip hop", "rap"],
         "description": "Assumed profile — legacy mainstream rap major: moderate risk tolerance, values crossover commercial potential.",
     },
     "Death Row Records": {
@@ -422,47 +512,63 @@ LABEL_PROFILES = {
         "min_flr": 3,
         "min_mu": 0.03,
         "max_hit_age_years": 4.0,
-        "description": "Assumed profile — historically star/hit-driven and aggressive; tolerates high concentration risk for a breakout artist.",
+        "genres": ["hip hop", "rap", "gangsta rap", "west coast rap"],
+        "description": "Calibrated from real signing history — Snoop Dogg and Tha Dogg Pound were signed off little more than guest features, while 2Pac was already a two-album star when he joined. Confirms a star/hit-driven, aggressive profile willing to bet on raw talent or buy an established name.",
     },
     "Cash Money Records": {
         "max_cr": 5.0,
         "min_flr": 4,
         "min_mu": 0.03,
         "max_hit_age_years": 3.5,
-        "description": "Assumed profile — hit-driven commercial rap/pop crossover, built around star power over catalog depth.",
+        "genres": ["hip hop", "rap"],
+        "description": "Calibrated from real signing history — Lil Wayne (1995) was signed with literally no digital footprint (regional cassette/CD sales only, years before streaming existed), well before he broke commercially. His first post-signing album, Tha Block Is Hot, went RIAA Platinum and hit #3 on the Billboard 200 — the bet on zero traction paid off. Confirms a hit-driven, star-power-over-catalog-depth profile.",
     },
     "Bad Boy Records": {
         "max_cr": 4.8,
         "min_flr": 4,
         "min_mu": 0.025,
         "max_hit_age_years": 4.0,
-        "description": "Assumed profile — image and star-driven, tolerant of hit concentration in service of crossover appeal.",
+        "genres": ["hip hop", "rap", "r&b", "rnb"],
+        "description": "Calibrated from real signing history — The Notorious B.I.G. (1993, pre-streaming demo tapes) was signed off a single, no album, and went on to Ready to Die: 6x Multi-Platinum, two top-10 Hot 100 hits — one of the highest-conviction bets in this dataset paying off at the highest level. Machine Gun Kelly (~5M early YouTube/DatPiff views) followed the same unproven-to-signed pattern decades later. Confirms an image- and star-driven profile tolerant of hit concentration, with a traction bar that scales to whatever proof of buzz looked like in that era.",
+    },
+    "Young Money Entertainment": {
+        "max_cr": 4.5,
+        "min_flr": 4,
+        "min_mu": 0.02,
+        "max_hit_age_years": 3.0,
+        "genres": ["hip hop", "rap"],
+        "description": "Calibrated from real signing history — Drake (~500k mixtape downloads on So Far Gone) and Nicki Minaj (~250k mixtape downloads) were both signed at modest pre-signing scale; Tyga had a debut album but no measurable streaming footprint listed. Both bets converted at the highest level — Drake's Thank Me Later and Nicki's Pink Friday both went 4x/3x Multi-Platinum and debuted at #1 on the Billboard 200. That modest entry bar lowered the growth-rate requirement (min_mu) from the original estimate; the hit rate on that low bar has been exceptional.",
     },
     "Aftermath Entertainment": {
         "max_cr": 2.2,
-        "min_flr": 18,
+        "min_flr": 14,
         "min_mu": 0.02,
         "max_hit_age_years": 4.0,
-        "description": "Assumed profile — famously selective/low-volume roster; wants deep catalog quality and loyalty, not just a viral single.",
+        "genres": ["hip hop", "rap", "r&b", "rnb"],
+        "description": "Calibrated from real signing history — Eminem, 50 Cent and The Game were all signed with zero digital footprint (pre-streaming cassette/mixtape-CD era), while later signees Kendrick Lamar (~10M) and Anderson .Paak (~15M) arrived with real streaming numbers. The hit rate on those zero-traction bets is extraordinary: Eminem (5x Multi-Platinum), 50 Cent (9x Multi-Platinum, #1 debut) and The Game (2x Multi-Platinum, #1 debut) all broke at the highest commercial tier. Dre signs raw, largely unproven talent despite the label's famously small, low-volume roster, but still wants depth and versatility over a single viral moment, hence the low concentration-risk ceiling.",
     },
     "Collective Music Group": {
         "max_cr": 4.2,
-        "min_flr": 6,
-        "min_mu": 0.025,
+        "min_flr": 4,
+        "min_mu": 0.03,
         "max_hit_age_years": 2.5,
-        "description": "Assumed profile — contemporary trap/hip-hop imprint, moderate risk tolerance with an emphasis on growth.",
+        "genres": ["hip hop", "rap", "drill", "trap"],
+        "description": "Calibrated from real signing history — Moneybagg Yo (~2M), 42 Dugg (~10M regional Detroit streams) and GloRilla (~25M viral TikTok/Spotify streams) were all signed straight off a mixtape or EP, but with consistently strong pre-signing momentum. Both 42 Dugg and GloRilla's first post-signing projects went RIAA Gold with top-10 Hot 100 hits, confirming that momentum reliably converts here. Low entry bar on catalog depth, but the growth-rate bar (min_mu) was raised to match that real momentum.",
     },
     "pgLang": {
         "max_cr": 2.4,
         "min_flr": 15,
+        "min_mu": 0.03,
         "max_hit_age_years": 3.0,
-        "description": "Assumed profile — boutique, artist-development-focused: prioritizes catalog depth and creative reputation over rapid growth.",
+        "genres": ["hip hop", "rap", "conscious hip hop"],
+        "description": "Calibrated from real signing history — the one roster data point available, Baby Keem, had ~50M streams on 'ORANGE SODA' before signing (explosive, not just developing, momentum); Tanna Leone was signed off singles only. That bet converted into a Gold-certified, Grammy-winning album (The Melodic Blue, #5 Billboard 200). Still boutique and creative-reputation-focused, but the single clear data point argues for a real growth-rate bar rather than none — treat min_mu here as provisional given the small sample.",
     },
     "UMG": {
         "max_cr": 4.5,
         "min_flr": 5,
         "min_mu": 0.02,
         "max_hit_age_years": 3.0,
+        # No "genres" key — same reasoning as Interscope (a UMG imprint).
         "description": "Assumed profile — major-label generalist, similar risk appetite to Interscope (a UMG imprint).",
     },
 
@@ -472,6 +578,7 @@ LABEL_PROFILES = {
         "min_flr": 6,
         "min_mu": 0.02,
         "max_hit_age_years": 3.0,
+        # No "genres" key: major generalist across pop/hip-hop/rock/etc.
         "description": "Assumed profile — major pop/hip-hop powerhouse (Drake, Ariana Grande, Metro Boomin): expects big streaming scale and steady growth, moderate hit-dependence tolerance.",
     },
     "Columbia Records": {
@@ -479,6 +586,7 @@ LABEL_PROFILES = {
         "min_flr": 6,
         "min_mu": 0.02,
         "max_hit_age_years": 3.0,
+        # No "genres" key — major generalist, same reasoning as Republic.
         "description": "Assumed profile — major-label generalist across genres, similar risk appetite to Republic/Interscope.",
     },
     "Interscope Geffen A&M": {
@@ -486,7 +594,10 @@ LABEL_PROFILES = {
         "min_flr": 5,
         "min_mu": 0.02,
         "max_hit_age_years": 3.0,
-        "description": "Assumed profile — the combined Interscope umbrella (IGA): same risk appetite as the standalone Interscope profile above.",
+        # No "genres" key: IGA signs across nearly every genre as a
+        # major-label generalist, so it isn't genre-gated like a boutique
+        # or identity-driven imprint elsewhere in this dict.
+        "description": "Assumed profile — the combined Interscope Geffen A&M umbrella (IGA): major-label generalist, tolerates some hit-dependence, wants steady growth.",
     },
 
     # --- Indie / alternative ---------------------------------------------
@@ -494,12 +605,14 @@ LABEL_PROFILES = {
         "max_cr": 3.0,
         "min_flr": 12,
         "max_hit_age_years": 4.0,
+        "genres": ["indie", "alternative", "rock", "indie rock", "grunge"],
         "description": "Assumed profile — storied indie/alt label (Nirvana's old home): values a loyal cult following and catalog depth over chart velocity.",
     },
     "Matador Records": {
         "max_cr": 3.0,
         "min_flr": 12,
         "max_hit_age_years": 4.0,
+        "genres": ["indie", "alternative", "rock", "indie rock"],
         "description": "Assumed profile — critically-driven indie label: prioritizes a devoted listener base over hit concentration.",
     },
     "Fueled by Ramen": {
@@ -507,19 +620,22 @@ LABEL_PROFILES = {
         "min_flr": 8,
         "min_mu": 0.015,
         "max_hit_age_years": 3.0,
+        "genres": ["pop punk", "emo", "alternative", "rock", "alternative rock"],
         "description": "Assumed profile — pop-punk/emo home (Paramore, Twenty One Pilots): built on loyal fanbases, with room for growth-stage acts.",
     },
     "Third Man Records": {
         "max_cr": 2.8,
         "min_flr": 14,
         "max_hit_age_years": 5.0,
-        "description": "Assumed profile — Jack White's boutique label: very niche/collector-driven, prioritizes deep fan loyalty over scale.",
+        "genres": ["rock", "blues", "garage rock", "alternative", "indie"],
+        "description": "Calibrated from real signing history — Margo Price and The Black Belles were both signed with no album out yet. Confirms Jack White's boutique label takes unproven acts into a very niche/collector-driven, deep-fan-loyalty-over-scale profile.",
     },
     "Astralwerks": {
         "max_cr": 3.5,
         "min_flr": 8,
         "min_mu": 0.02,
         "max_hit_age_years": 3.0,
+        "genres": ["electronic", "alternative", "pop", "indietronica", "dance"],
         "description": "Assumed profile — electronic/alt crossover imprint (Halsey, Flume): moderate risk tolerance, values growth trajectory.",
     },
 
@@ -529,19 +645,22 @@ LABEL_PROFILES = {
         "min_flr": 3,
         "min_mu": 0.03,
         "max_hit_age_years": 2.5,
+        "genres": ["edm", "house", "dance", "electronic", "electro"],
         "description": "Assumed profile — big-room EDM label: tolerates high hit concentration and lower per-listener loyalty, hype/velocity-driven.",
     },
     "Anjunabeats / Anjunadeep": {
         "max_cr": 3.0,
         "min_flr": 10,
         "max_hit_age_years": 3.5,
-        "description": "Assumed profile — trance/deep house imprints known for unusually dedicated fan communities: values loyalty over viral scale.",
+        "genres": ["trance", "deep house", "progressive house", "electronic", "edm"],
+        "description": "Calibrated from real signing history — Mat Zo, Ilan Bluestone and Lane 8 were all signed off a single with no album yet. Confirms Above & Beyond's imprints take developing talent but hold them to unusually dedicated fan communities and value loyalty over viral scale.",
     },
     "Ninja Tune": {
         "max_cr": 3.0,
         "min_flr": 10,
         "max_hit_age_years": 4.0,
-        "description": "Assumed profile — boutique leftfield electronic/hip-hop label: catalog depth and listener loyalty over mainstream velocity.",
+        "genres": ["electronic", "trip hop", "leftfield", "experimental", "hip hop", "downtempo"],
+        "description": "Calibrated from real signing history — Cinematic Orchestra was signed off a single, while Bonobo already had a debut album; both fit a boutique leftfield electronic profile valuing catalog depth and listener loyalty over mainstream velocity.",
     },
 
     # --- Country -----------------------------------------------------------
@@ -550,12 +669,14 @@ LABEL_PROFILES = {
         "min_flr": 7,
         "min_mu": 0.02,
         "max_hit_age_years": 3.0,
+        "genres": ["country", "country pop"],
         "description": "Assumed profile — mainstream country-pop major (Taylor Swift's former home): expects commercial scale and steady growth.",
     },
     "MCA Nashville": {
         "max_cr": 3.5,
         "min_flr": 8,
         "max_hit_age_years": 4.0,
+        "genres": ["country"],
         "description": "Assumed profile — traditional/mainstream country imprint: values a loyal audience over rapid velocity.",
     },
 
@@ -564,24 +685,28 @@ LABEL_PROFILES = {
         "max_cr": 2.5,
         "min_flr": 15,
         "max_hit_age_years": 6.0,
+        "genres": ["folk", "bluegrass", "americana", "roots"],
         "description": "Assumed profile — roots/folk/bluegrass label: low-volume, catalog-and-loyalty-driven, tolerant of an older-skewing catalog.",
     },
     "Blue Note Records": {
         "max_cr": 2.5,
         "min_flr": 18,
         "max_hit_age_years": 6.0,
+        "genres": ["jazz"],
         "description": "Assumed profile — legendary jazz imprint: deep listener loyalty expected, not a hits-driven or velocity-driven signing.",
     },
     "Impulse! Records": {
         "max_cr": 2.5,
         "min_flr": 18,
         "max_hit_age_years": 6.0,
+        "genres": ["jazz"],
         "description": "Assumed profile — jazz label in the same mold as Blue Note: catalog depth and loyalty over scale or recency.",
     },
     "Alligator Records": {
         "max_cr": 2.5,
         "min_flr": 15,
         "max_hit_age_years": 6.0,
+        "genres": ["blues"],
         "description": "Assumed profile — blues specialty label: small, devoted audience expected; an aging catalog isn't disqualifying here.",
     },
 
@@ -590,29 +715,116 @@ LABEL_PROFILES = {
         "max_cr": 3.0,
         "min_flr": 12,
         "max_hit_age_years": 4.0,
+        "genres": ["metal", "heavy metal", "death metal"],
         "description": "Assumed profile — major metal label: fanbase loyalty (touring, merch, album sales) matters more than streaming hit concentration.",
     },
     "Epitaph Records": {
         "max_cr": 3.2,
         "min_flr": 10,
         "max_hit_age_years": 4.0,
-        "description": "Assumed profile — punk institution (Bad Religion, NOFX): cult loyalty valued over mainstream streaming velocity.",
+        "genres": ["punk", "pop punk", "hardcore", "rock"],
+        "description": "Calibrated from real signing history — Rancid was signed off just an EP, while The Offspring already had a debut album when they joined. Confirms this punk institution (Bad Religion, NOFX) values cult loyalty over mainstream streaming velocity, whether the artist is developing or already established.",
     },
     "Metal Blade Records": {
         "max_cr": 3.0,
         "min_flr": 12,
         "max_hit_age_years": 4.0,
+        "genres": ["metal", "thrash metal", "heavy metal"],
         "description": "Assumed profile — metal label in the Nuclear Blast mold: loyalty-driven, tolerant of a slower-moving catalog.",
+    },
+
+    # --- Additional hip-hop / R&B imprints ---------------------------------
+    "GOOD Music": {
+        "max_cr": 4.0,
+        "min_flr": 6,
+        "min_mu": 0.015,
+        "max_hit_age_years": 3.5,
+        "genres": ["hip hop", "rap", "r&b", "rnb"],
+        "description": "Calibrated from real signing history — John Legend and Pusha T (via Clipse) were signed with literally no streaming footprint (pre-streaming demo/live-show era), and Big Sean's ~100k mixtape downloads were modest too. Both low-traction bets converted big: John Legend's Get Lifted went 2x Multi-Platinum and Big Sean's Finally Famous went Platinum. That low pre-signing scale lowered the growth-rate bar (min_mu) from the original estimate — Kanye's imprint bets on creative reputation and crossover potential over proven momentum.",
+    },
+    "1017 Records": {
+        "max_cr": 5.5,
+        "min_flr": 2,
+        "min_mu": 0.035,
+        "max_hit_age_years": 2.0,
+        "genres": ["hip hop", "rap", "trap"],
+        "description": "Calibrated from real signing history — Waka Flocka Flame (~200k downloads), Young Thug (~1M views) and Pooh Shiesty (~15M streams) were all signed off a mixtape or single, none with an album yet, spanning modest regional buzz to real viral reach. Waka Flocka's Flockaveli and Pooh Shiesty's Shiesty Season both went Gold, each carrying a 3x-Platinum single. Confirms Gucci Mane's prolific mixtape-culture label tolerates very high hit concentration and prioritizes release velocity over catalog depth.",
+    },
+    "YSL Records": {
+        "max_cr": 5.5,
+        "min_flr": 2,
+        "min_mu": 0.035,
+        "max_hit_age_years": 2.5,
+        "genres": ["hip hop", "rap", "trap"],
+        "description": "Calibrated from real signing history — Gunna (~500k mixtape plays) and Lil Keed (~3M streams) were both signed as unproven mixtape-stage artists with no major label track record. Confirms an aggressive, hit-driven trap collective built around viral singles and star power.",
+    },
+    "Maybach Music Group": {
+        "max_cr": 4.5,
+        "min_flr": 4,
+        "min_mu": 0.03,
+        "max_hit_age_years": 3.5,
+        "genres": ["hip hop", "rap", "r&b", "rnb"],
+        "description": "Calibrated from real signing history — Meek Mill was signed off ~1M mixtape downloads, while Wale was already an established, charting act (Billboard 200 sales via Interscope) joining for a crossover relaunch; Wale's Ambition went Gold and hit #2 on the Billboard 200. Confirms a star-power, crossover-appeal profile open to both developing and already-established talent.",
+    },
+    "Roc Nation": {
+        "max_cr": 4.0,
+        "min_flr": 4,
+        "min_mu": 0.02,
+        "max_hit_age_years": 3.5,
+        "genres": ["hip hop", "rap", "r&b", "rnb", "pop"],
+        "description": "Calibrated from real signing history — J. Cole (~250k downloads, blog era) and Rihanna (demo CD audition tapes, no music released at all) were both signed with essentially zero traction. Both bets converted: J. Cole's pre-studio mixtape The Warm Up went 2x Platinum on DatPiff (700k+ downloads), and Rihanna's debut Music of the Sun went Gold, hitting #10 on the Billboard 200 with a #2 Hot 100 single. Confirms Jay-Z's company bets on undiscovered talent across hip-hop/R&B/pop, then expects commercial scale and steady growth like a major.",
+    },
+    "Starboy Entertainment": {
+        "max_cr": 3.0,
+        "min_flr": 10,
+        "min_mu": 0.015,
+        "max_hit_age_years": 4.0,
+        "genres": ["r&b", "rnb", "pop", "alternative r&b", "afrobeats"],
+        "description": "Calibrated from real signing history — L.A.X. and Terri were both signed off a single with no album. Confirms The Weeknd's imprint prioritizes artistic identity and atmosphere over raw hit concentration; roster evidence (both Afrobeats artists) adds that genre to the label's profile.",
     },
 }
 
 
 
+def _genre_match(artist_genres: list[str], label_genres: list[str]) -> bool:
+    """
+    True if any of the artist's genre tags overlaps any of a label's
+    accepted genres, using substring containment in both directions
+    (case-insensitive) rather than exact string equality.
+
+    Last.fm genre tags are free-text community tags, not a fixed taxonomy
+    — the same artist might be tagged "rap," "Hip-Hop," or "conscious hip
+    hop" depending on who tagged them. Substring matching (e.g. the label
+    keyword "hip hop" matching the artist tag "conscious hip hop") catches
+    far more of these than exact matching would, at the cost of being a
+    little permissive at the edges.
+    """
+    artist_lower = [g.lower() for g in artist_genres]
+    label_lower = [g.lower() for g in label_genres]
+    for a in artist_lower:
+        for l in label_lower:
+            if l in a or a in l:
+                return True
+    return False
+
+
 def label_benchmark_fit(
-    cr: float, flr: float, mu: float, catalog_recency_years: float | None = None
+    cr: float,
+    flr: float,
+    mu: float,
+    catalog_recency_years: float | None = None,
+    artist_genres: list[str] | None = None,
 ) -> dict:
     """
     Score an artist's metrics against each predefined label profile.
+
+    Real A&R decisions aren't only about an artist's numbers — genre and
+    identity rule labels in or out before the numbers even get discussed
+    (a rap label doesn't sign an indie-pop band, no matter how strong its
+    fan-loyalty score is). This function checks genre fit first, then the
+    same quantitative thresholds (CR, FLR, growth, catalog recency) as
+    before, so a label can fail on either identity or traction/commercial
+    potential.
 
     Parameters
     ----------
@@ -628,6 +840,13 @@ def label_benchmark_fit(
         "max_hit_age_years" when both are available. None (no Spotify
         release-date match for any track) skips this check entirely
         rather than treating missing data as a failure.
+    artist_genres : list[str] | None
+        The artist's Last.fm genre/community tags. Checked against each
+        profile's "genres" list when both are present and non-empty. A
+        label profile with no "genres" key (the big major-label
+        generalists, which sign across nearly every genre) skips this
+        check entirely, as does an artist with no genre tags at all —
+        missing genre data isn't treated as a mismatch.
 
     Returns
     -------
@@ -640,6 +859,17 @@ def label_benchmark_fit(
     for label, rules in LABEL_PROFILES.items():
         reasons = []
         fits = True
+
+        if (
+            "genres" in rules
+            and artist_genres
+            and not _genre_match(artist_genres, rules["genres"])
+        ):
+            fits = False
+            reasons.append(
+                f"Genre mismatch: artist tagged {', '.join(artist_genres[:3])}; "
+                f"this label signs {', '.join(rules['genres'][:3])}"
+            )
 
         if "max_cr" in rules and cr > rules["max_cr"]:
             fits = False
@@ -670,6 +900,80 @@ def label_benchmark_fit(
         results[label] = {"fits": fits, "reasons": reasons}
 
     return results
+
+
+# --- Size-scaled investment boost -----------------------------------------
+# A label's marketing spend doesn't move every artist the same amount. The
+# same $100k promo budget is a rounding error for an artist already pulling
+# tens of millions of monthly streams, but can meaningfully accelerate an
+# artist who's still under a million listeners. These tiers are this app's
+# own modeling assumption — not a published industry formula — encoding
+# "signing helps a small artist more, in relative terms, than a big one."
+SIZE_TIERS = [
+    # (listener ceiling, multiplier on the computed boost, cap on mu/month)
+    (1_000_000, 2.0, 0.15),      # emerging: marketing spend goes furthest here
+    (10_000_000, 1.0, 0.08),     # growing: the original baseline behavior
+    (float("inf"), 0.4, 0.03),   # established/superstar: diminishing returns
+]
+
+
+def compute_investment_boost(
+    advance: float,
+    current_monthly_revenue: float,
+    listeners: int,
+    months: int,
+    marketing_spend_fraction: float = 0.10,
+) -> float:
+    """
+    Models how much of a monthly growth-rate boost a label's advance buys,
+    on top of an artist's organic growth — this app's own assumption, not
+    an industry formula.
+
+    Base idea: the label spends a fixed fraction of the advance on
+    promotion, and that spend matters more, proportionally, to an artist
+    with less existing monthly revenue (the same dollar amount is a bigger
+    relative push). On top of that base ratio, SIZE_TIERS applies an
+    explicit multiplier and cap by audience size: an artist under 1M
+    listeners gets amplified further (up to 15%/month), a "growing" artist
+    (1M-10M listeners) gets the original baseline (up to 8%/month), and an
+    established/superstar artist (10M+ listeners) sees sharply diminishing
+    returns (up to 3%/month) — a label's marketing dollars just don't move
+    the needle much for an artist already at that scale.
+
+    Parameters
+    ----------
+    advance : float
+        Proposed advance amount, in dollars.
+    current_monthly_revenue : float
+        Artist's current monthly streaming revenue, in dollars.
+    listeners : int
+        Artist's unique listener count (from Last.fm), used to pick the
+        size tier.
+    months : int
+        Number of months the boost is spread across (the simulation
+        horizon).
+    marketing_spend_fraction : float
+        Share of the advance assumed to go to promotion.
+
+    Returns
+    -------
+    float
+        Monthly growth-rate boost (e.g. 0.08 = +8%/month), already capped
+        for the artist's size tier.
+    """
+    if current_monthly_revenue <= 0 or months <= 0:
+        return 0.0
+
+    marketing_spend = advance * marketing_spend_fraction
+    raw_boost = marketing_spend / current_monthly_revenue / months
+
+    multiplier, cap = 1.0, 0.08
+    for ceiling, tier_multiplier, tier_cap in SIZE_TIERS:
+        if listeners < ceiling:
+            multiplier, cap = tier_multiplier, tier_cap
+            break
+
+    return min(raw_boost * multiplier, cap)
 
 
 if __name__ == "__main__":

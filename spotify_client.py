@@ -163,6 +163,66 @@ def get_track_release_years(track_names: list[str], artist_name: str) -> dict[st
     return results
 
 
+def get_latest_album_years_ago(artist_id: str) -> float | None:
+    """
+    Find how long ago this artist's most recent album (not single/EP) came
+    out, via Spotify's artist-albums endpoint. Used by
+    risk_engine.analyze_hit_timeline() to catch a specific red flag a
+    track-level timeline alone can miss: an artist who just put out a full
+    album, but none of its songs cracked their own top-tracks list — a
+    release that didn't land, not a quiet period.
+
+    NOTE: like get_track_release_years(), this uses a basic catalog
+    browsing endpoint (an artist's own discography), not the blocked
+    top-tracks/followers/popularity endpoints — see search_artist's
+    docstring for what's actually restricted.
+
+    Parameters
+    ----------
+    artist_id : str
+        Spotify artist ID, from search_artist()'s "id" field.
+
+    Returns
+    -------
+    float | None
+        Years since the most recent album's release, or None if no
+        album was found (e.g. the artist only ever releases singles, or
+        the lookup failed).
+    """
+    sp = get_spotify_client()
+    today = date.today()
+
+    try:
+        results = sp.artist_albums(
+            artist_id, album_type="album", limit=50, country="US"
+        )
+        items = results.get("items", [])
+    except Exception:
+        return None
+
+    if not items:
+        return None
+
+    release_dates = []
+    for album in items:
+        release_date = album.get("release_date")
+        if not release_date:
+            continue
+        try:
+            year = int(release_date[:4])
+            month = int(release_date[5:7]) if len(release_date) >= 7 else 7
+            day = int(release_date[8:10]) if len(release_date) >= 10 else 1
+            release_dates.append(date(year, month, day))
+        except (ValueError, IndexError):
+            continue
+
+    if not release_dates:
+        return None
+
+    latest = max(release_dates)
+    return max((today - latest).days / 365.25, 0.0)
+
+
 if __name__ == "__main__":
     # Quick manual smoke test: run `python spotify_client.py` to confirm
     # your credentials work and see real data printed to the console.
